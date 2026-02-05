@@ -1,10 +1,16 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const mongoose = require('mongoose');
-require('dotenv').config(); // for MONGO_URI
+const jwt = require('jsonwebtoken');
+
+// =======================
+// CONFIG
+// =======================
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
 
 // =======================
 // MongoDB Setup
@@ -25,8 +31,8 @@ const userSchema = new mongoose.Schema({
 });
 
 const messageSchema = new mongoose.Schema({
-  group: { type: String },             // optional: for future public groups
-  privateRoom: { type: String },       // optional: for private chats
+  group: { type: String },
+  privateRoom: { type: String },
   username: { type: String, required: true },
   message: { type: String, required: true },
   time: { type: Date, default: Date.now }
@@ -35,6 +41,8 @@ const messageSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 const Message = mongoose.model('Message', messageSchema);
 
+// =======================
+// Express Setup
 // =======================
 const app = express();
 const server = http.createServer(app);
@@ -45,10 +53,27 @@ const io = new Server(server, {
   }
 });
 
-// Middleware
 app.use(express.json());
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// =======================
+// AUTH MIDDLEWARE
+// =======================
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: 'No token provided' });
+
+  const token = header.split(' ')[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
 
 // =======================
 // API Routes
@@ -81,25 +106,26 @@ app.post('/api/login', async (req, res) => {
 
   try {
     const user = await User.findOne({ username });
-    if (!user || user.password !== password) return res.status(400).json({ error: 'Invalid credentials' });
+    if (!user || user.password !== password) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-    console.log(`Logged in: ${username}`);
-    res.json({ success: true });
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ success: true, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Search user by username
-app.get('/searchUser', async (req, res) => {
+// Search user
+app.get('/searchUser', authMiddleware, async (req, res) => {
   const { username } = req.query;
   if (!username) return res.status(400).json({ error: 'Missing username' });
 
   try {
     const user = await User.findOne({ username });
     if (!user) return res.json({ found: false });
-
     res.json({ found: true, username: user.username });
   } catch (err) {
     console.error(err);
@@ -107,25 +133,23 @@ app.get('/searchUser', async (req, res) => {
   }
 });
 
-// Get all private chats (DMs) for a user
-app.get('/api/privateChats/:username', async (req, res) => {
-  const { username } = req.params;
-  if (!username) return res.status(400).json({ error: 'Missing username' });
+// Get private chats
+app.get('/api/privateChats/:username', authMiddleware, async (req, res) => {
+  if (req.user.username !== req.params.username) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 
   try {
-    // Find all messages in rooms including this user
     const messages = await Message.find({
       privateRoom: { $exists: true },
-      privateRoom: { $regex: username }
+      privateRoom: { $regex: req.params.username }
     }).select('privateRoom').lean();
 
     const roomsSet = new Set();
     messages.forEach(m => roomsSet.add(m.privateRoom));
-    const rooms = Array.from(roomsSet);
 
-    // Map rooms to the other participant's username
-    const dms = rooms.map(room => {
-      const parts = room.split('_').filter(p => p !== username && p !== 'private');
+    const dms = Array.from(roomsSet).map(room => {
+      const parts = room.split('_').filter(p => p !== req.params.username && p !== 'private');
       return parts[0];
     });
 
@@ -137,63 +161,92 @@ app.get('/api/privateChats/:username', async (req, res) => {
 });
 
 // =======================
-// Socket.IO - Real-time chat
+// Secure Socket.IO
 // =======================
-const onlineUsers = {}; // { socketId: username }
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('No token'));
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.username = decoded.username;
+    next();
+  } catch {
+    next(new Error('Invalid token'));
+  }
+});
+
+const onlineUsers = {};
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log(`User connected: ${socket.username}`);
 
-  // Join private room
-  socket.on('joinRoom', async ({ room, username }) => {
+  socket.on('joinRoom', async ({ room }) => {
     socket.join(room);
-    onlineUsers[socket.id] = username;
+    onlineUsers[socket.id] = socket.username;
 
-    // Load last 50 messages from MongoDB for this room
-    const lastMessages = await Message.find({ privateRoom: room }).sort({ time: 1 }).limit(50);
+    const lastMessages = await Message.find({ privateRoom: room })
+      .sort({ time: 1 })
+      .limit(50);
+
     lastMessages.forEach(msg => {
-      socket.emit('receiveMessage', { username: msg.username, message: msg.message, time: msg.time, room });
+      socket.emit('receiveMessage', {
+        username: msg.username,
+        message: msg.message,
+        time: msg.time,
+        room
+      });
     });
 
-    socket.to(room).emit('systemMessage', { message: `${username} joined the chat`, room });
-    console.log(`${username} joined room: ${room}`);
+    socket.to(room).emit('systemMessage', {
+      message: `${socket.username} joined the chat`,
+      room
+    });
+
+    console.log(`${socket.username} joined ${room}`);
   });
 
-  // Leave room
   socket.on('leaveRoom', ({ room }) => {
     socket.leave(room);
-    console.log(`${onlineUsers[socket.id]} left room: ${room}`);
+    console.log(`${socket.username} left ${room}`);
   });
 
-  // Send message
-  socket.on('sendMessage', async ({ room, message, username }) => {
-    if (!username || !room) return;
+  socket.on('sendMessage', async ({ room, message }) => {
+    if (!room || !message) return;
 
-    const msgObj = { privateRoom: room, username, message, time: new Date() };
-    const newMsg = new Message(msgObj);
-    await newMsg.save();
+    const msgObj = {
+      privateRoom: room,
+      username: socket.username,
+      message,
+      time: new Date()
+    };
 
+    await new Message(msgObj).save();
     io.to(room).emit('receiveMessage', msgObj);
   });
 
-  // WebRTC signaling
   socket.on('callUser', (data) => {
-    io.to(data.to).emit('incomingCall', { from: socket.id, signal: data.signal });
+    io.to(data.to).emit('incomingCall', {
+      from: socket.id,
+      signal: data.signal,
+      username: socket.username
+    });
   });
+
   socket.on('answerCall', (data) => {
     io.to(data.to).emit('callAccepted', data.signal);
   });
 
-  // Disconnect
   socket.on('disconnect', () => {
-    const username = onlineUsers[socket.id];
-    console.log('User disconnected:', username);
+    console.log(`User disconnected: ${socket.username}`);
     delete onlineUsers[socket.id];
   });
 });
 
 // =======================
-// Start server
+// Start Server
 // =======================
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Chatsphere backend running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`🚀 Chatsphere backend running on port ${PORT}`);
+});
