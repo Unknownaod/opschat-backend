@@ -1,28 +1,30 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: 'https://chatsphere.opslinksystems.xyz', // change to your Vercel URL
+    methods: ['GET', 'POST']
+  }
+});
 
-// =======================
 // Middleware
-// =======================
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public'))); // serve static files
+app.use(cors());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// =======================
-// Simple in-memory "database" for demo
-// =======================
+// In-memory "database"
 const users = {};       // { username: { password } }
 const onlineUsers = {}; // { socketId: username }
 const groups = {};      // { groupName: [messages] }
 
 // =======================
-// Routes
+// API Routes
 // =======================
 
 // Register
@@ -31,6 +33,7 @@ app.post('/api/register', (req, res) => {
   if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
   if (users[username]) return res.status(400).json({ error: 'User exists' });
   users[username] = { password };
+  console.log(`Registered: ${username}`);
   return res.json({ success: true });
 });
 
@@ -40,28 +43,31 @@ app.post('/api/login', (req, res) => {
   if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
   if (!users[username] || users[username].password !== password)
     return res.status(400).json({ error: 'Invalid credentials' });
+  console.log(`Logged in: ${username}`);
   return res.json({ success: true });
 });
 
 // =======================
-// Socket.IO for chat
+// Socket.IO - Real-time chat
 // =======================
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // Join group
+  // Join a group
   socket.on('joinGroup', ({ username, group }) => {
     socket.join(group);
     onlineUsers[socket.id] = username;
     if (!groups[group]) groups[group] = [];
     socket.to(group).emit('systemMessage', `${username} joined ${group}`);
+    console.log(`${username} joined ${group}`);
   });
 
-  // Message
+  // Send message
   socket.on('sendMessage', ({ group, message }) => {
     const username = onlineUsers[socket.id];
     if (!username) return;
     const msgObj = { username, message, time: new Date().toISOString() };
+    if (!groups[group]) groups[group] = [];
     groups[group].push(msgObj);
     io.to(group).emit('receiveMessage', msgObj);
   });
@@ -70,7 +76,6 @@ io.on('connection', (socket) => {
   socket.on('callUser', (data) => {
     io.to(data.to).emit('incomingCall', { from: socket.id, signal: data.signal });
   });
-
   socket.on('answerCall', (data) => {
     io.to(data.to).emit('callAccepted', data.signal);
   });
